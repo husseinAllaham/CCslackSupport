@@ -86,7 +86,8 @@ app.message(async ({ message, say, client }) => {
       ],
     });
 
-    parsed = JSON.parse(aiResponse.content[0].text);
+    const raw = aiResponse.content[0].text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+    parsed = JSON.parse(raw);
   } catch (err) {
     console.error('Claude error:', err.message);
     return;
@@ -105,11 +106,22 @@ app.message(async ({ message, say, client }) => {
   }
 
   if (parsed.type === 'ticket') {
+    let requesterName;
+    try {
+      const userInfo = await client.users.info({ user: message.user });
+      requesterName = userInfo.user.real_name
+        || userInfo.user.profile.display_name
+        || userInfo.user.name
+        || `<@${message.user}>`;
+    } catch (_) {
+      requesterName = `<@${message.user}>`;
+    }
+
     let task;
     try {
       task = await createClickUpTask({
         title: parsed.ticket_title,
-        description: `${parsed.ticket_description}\n\n---\nRequester: <@${message.user}>\nSource: ${threadUrl}`,
+        description: `${parsed.ticket_description}\n\n---\nRequester: ${requesterName}\nSource: ${threadUrl}`,
         assignee: parsed.assignee,
         priority: parsed.priority,
         category: parsed.category,

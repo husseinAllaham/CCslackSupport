@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
+User=hussein
 WorkingDirectory=/opt/cc-slack-support
 ExecStart=/usr/bin/node index.js
 Restart=always

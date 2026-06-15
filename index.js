@@ -30,6 +30,57 @@ const SLACK_USERS = {
   patrick: 'U02JPQPHBNJ',
 };
 
+// thread_ts → { userId, originalText, images, question }
+const pendingFollowups = new Map();
+
+const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
+async function fetchImages(files) {
+  const images = [];
+  for (const file of (files || [])) {
+    if (!IMAGE_TYPES.includes(file.mimetype)) continue;
+    try {
+      const resp = await axios.get(file.url_private, {
+        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+        responseType: 'arraybuffer',
+      });
+      images.push({ base64: Buffer.from(resp.data).toString('base64'), mediaType: file.mimetype });
+    } catch (_) {}
+  }
+  return images;
+}
+
+function buildContent(text, images) {
+  if (!images || images.length === 0) return text;
+  return [
+    ...images.map(img => ({
+      type: 'image',
+      source: { type: 'base64', media_type: img.mediaType, data: img.base64 },
+    })),
+    { type: 'text', text },
+  ];
+}
+
+async function resolveDisplayName(client, userId) {
+  try {
+    const info = await client.users.info({ user: userId });
+    return info.user.real_name || info.user.profile.display_name || info.user.name || `<@${userId}>`;
+  } catch (_) {
+    return `<@${userId}>`;
+  }
+}
+
+async function callClaude(messages) {
+  const aiResponse = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1024,
+    system: SYSTEM_PROMPT,
+    messages,
+  });
+  const raw = aiResponse.content[0].text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+  return JSON.parse(raw);
+}
+
 async function createClickUpTask({ title, description, assignee, priority, category }) {
   const priorityMap = { urgent: 1, normal: 3, low: 4 };
   const response = await axios.post(
@@ -51,47 +102,94 @@ async function createClickUpTask({ title, description, assignee, priority, categ
   return response.data;
 }
 
+async function handleTicket({ parsed, requesterName, threadTs, channel, say, client }) {
+  const threadUrl = `${WORKSPACE_URL}/archives/${CHANNEL_ID}/p${threadTs.replace('.', '')}`;
+  let task;
+  try {
+    task = await createClickUpTask({
+      title: parsed.ticket_title,
+      description: `${parsed.ticket_description}\n\n---\nRequester: ${requesterName}\nSource: ${threadUrl}`,
+      assignee: parsed.assignee,
+      priority: parsed.priority,
+      category: parsed.category,
+    });
+  } catch (err) {
+    console.error('ClickUp error:', err.message);
+    await say({
+      text: `⚠️ Couldn't create the ClickUp task (API error). <@${SLACK_USERS[parsed.assignee] || SLACK_USERS.patrick}> — please pick this up manually.`,
+      thread_ts: threadTs,
+    });
+    return;
+  }
+
+  await client.reactions.add({ channel, timestamp: threadTs, name: 'clipboard' });
+  await say({
+    text: `:clipboard: Ticket logged → ${task.url}\nAssigned to <@${SLACK_USERS[parsed.assignee] || SLACK_USERS.patrick}>`,
+    thread_ts: threadTs,
+  });
+}
+
 app.error(async (error) => {
   console.error('Slack app error:', error);
 });
 
 app.message(async ({ message, say, client }) => {
-  // Skip all message subtypes (edits, unfurls, bot messages, etc.)
   if (message.subtype || message.bot_id) return;
-  // Skip thread replies
-  if (message.thread_ts && message.thread_ts !== message.ts) return;
-  // Only handle #it-support
   if (message.channel !== CHANNEL_ID) return;
 
-  // Build the text Claude will see
-  let userText = message.text || '';
+  const isThreadReply = message.thread_ts && message.thread_ts !== message.ts;
 
-  if (message.files && message.files.length > 0) {
-    const names = message.files.map(f => f.name || f.title || 'file').join(', ');
-    const fileNote = `[User attached: ${names} — image/file visible in Slack thread, not reproduced here]`;
-    userText = userText ? `${userText}\n\n${fileNote}` : fileNote;
+  // Handle follow-up replies to clarifying questions
+  if (isThreadReply) {
+    const pending = pendingFollowups.get(message.thread_ts);
+    if (!pending || pending.userId !== message.user) return;
+    pendingFollowups.delete(message.thread_ts);
+
+    const requesterName = await resolveDisplayName(client, message.user);
+    const followupImages = await fetchImages(message.files);
+    const followupText = message.text || '';
+
+    let parsed;
+    try {
+      parsed = await callClaude([
+        { role: 'user', content: buildContent(`New message from ${requesterName}:\n\n${pending.originalText}`, pending.images) },
+        { role: 'assistant', content: JSON.stringify({ type: 'needs_info', clarifying_question: pending.question }) },
+        { role: 'user', content: buildContent(`Additional info from ${requesterName}:\n\n${followupText}`, followupImages) },
+      ]);
+    } catch (err) {
+      console.error('Claude error (followup):', err.message);
+      return;
+    }
+
+    if (parsed.type === 'ticket') {
+      await handleTicket({ parsed, requesterName, threadTs: message.thread_ts, channel: message.channel, say, client });
+    } else if (parsed.type === 'self-serve') {
+      await say({ text: parsed.direct_response, thread_ts: message.thread_ts });
+    }
+    return;
   }
 
-  if (!userText.trim()) return;
+  // Top-level message
+  let userText = message.text || '';
+  const images = await fetchImages(message.files);
 
-  const threadUrl = `${WORKSPACE_URL}/archives/${CHANNEL_ID}/p${message.ts.replace('.', '')}`;
+  // Mention non-image attachments as text note
+  const nonImageFiles = (message.files || []).filter(f => !IMAGE_TYPES.includes(f.mimetype));
+  if (nonImageFiles.length > 0) {
+    const names = nonImageFiles.map(f => f.name || f.title || 'file').join(', ');
+    const note = `[User attached file(s): ${names} — visible in Slack thread]`;
+    userText = userText ? `${userText}\n\n${note}` : note;
+  }
+
+  if (!userText.trim() && images.length === 0) return;
+
+  const requesterName = await resolveDisplayName(client, message.user);
 
   let parsed;
   try {
-    const aiResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: `New message from <@${message.user}>:\n\n${userText}`,
-        },
-      ],
-    });
-
-    const raw = aiResponse.content[0].text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
-    parsed = JSON.parse(raw);
+    parsed = await callClaude([
+      { role: 'user', content: buildContent(`New message from ${requesterName}:\n\n${userText}`, images) },
+    ]);
   } catch (err) {
     console.error('Claude error:', err.message);
     return;
@@ -100,55 +198,24 @@ app.message(async ({ message, say, client }) => {
   if (parsed.type === 'ignore') return;
 
   if (parsed.type === 'self-serve') {
-    await client.reactions.add({
-      channel: message.channel,
-      timestamp: message.ts,
-      name: 'white_check_mark',
-    });
+    await client.reactions.add({ channel: message.channel, timestamp: message.ts, name: 'white_check_mark' });
     await say({ text: parsed.direct_response, thread_ts: message.ts });
     return;
   }
 
+  if (parsed.type === 'needs_info') {
+    pendingFollowups.set(message.ts, {
+      userId: message.user,
+      originalText: userText,
+      images,
+      question: parsed.clarifying_question,
+    });
+    await say({ text: parsed.clarifying_question, thread_ts: message.ts });
+    return;
+  }
+
   if (parsed.type === 'ticket') {
-    let requesterName;
-    try {
-      const userInfo = await client.users.info({ user: message.user });
-      requesterName = userInfo.user.real_name
-        || userInfo.user.profile.display_name
-        || userInfo.user.name
-        || `<@${message.user}>`;
-    } catch (_) {
-      requesterName = `<@${message.user}>`;
-    }
-
-    let task;
-    try {
-      task = await createClickUpTask({
-        title: parsed.ticket_title,
-        description: `${parsed.ticket_description}\n\n---\nRequester: ${requesterName}\nSource: ${threadUrl}`,
-        assignee: parsed.assignee,
-        priority: parsed.priority,
-        category: parsed.category,
-      });
-    } catch (err) {
-      console.error('ClickUp error:', err.message);
-      await say({
-        text: `⚠️ Couldn't create the ClickUp task (API error). <@${SLACK_USERS[parsed.assignee] || SLACK_USERS.patrick}> — please pick this up manually.`,
-        thread_ts: message.ts,
-      });
-      return;
-    }
-
-    await client.reactions.add({
-      channel: message.channel,
-      timestamp: message.ts,
-      name: 'clipboard',
-    });
-
-    await say({
-      text: `:clipboard: Ticket logged → ${task.url}\nAssigned to <@${SLACK_USERS[parsed.assignee] || SLACK_USERS.patrick}>`,
-      thread_ts: message.ts,
-    });
+    await handleTicket({ parsed, requesterName, threadTs: message.ts, channel: message.channel, say, client });
   }
 });
 

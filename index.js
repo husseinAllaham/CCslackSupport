@@ -51,9 +51,13 @@ async function createClickUpTask({ title, description, assignee, priority, categ
   return response.data;
 }
 
+app.error(async (error) => {
+  console.error('Slack app error:', error);
+});
+
 app.message(async ({ message, say, client }) => {
-  // Skip bots
-  if (message.bot_id || message.subtype === 'bot_message') return;
+  // Skip all message subtypes (edits, unfurls, bot messages, etc.)
+  if (message.subtype || message.bot_id) return;
   // Skip thread replies
   if (message.thread_ts && message.thread_ts !== message.ts) return;
   // Only handle #it-support

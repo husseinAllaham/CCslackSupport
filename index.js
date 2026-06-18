@@ -2,6 +2,7 @@ require('dotenv').config();
 const { App } = require('@slack/bolt');
 const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
+const FormData = require('form-data');
 const SYSTEM_PROMPT = require('./system-prompt');
 
 const app = new App({
@@ -30,36 +31,10 @@ const SLACK_USERS = {
   patrick: 'U02JPQPHBNJ',
 };
 
-// thread_ts → { userId, originalText, images, question }
+// thread_ts → { userId, originalText, fileNote, files, question }
 const pendingFollowups = new Map();
-
-const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-
-async function fetchImages(files) {
-  const images = [];
-  for (const file of (files || [])) {
-    if (!IMAGE_TYPES.includes(file.mimetype)) continue;
-    try {
-      const resp = await axios.get(file.url_private, {
-        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-        responseType: 'arraybuffer',
-      });
-      images.push({ base64: Buffer.from(resp.data).toString('base64'), mediaType: file.mimetype });
-    } catch (_) {}
-  }
-  return images;
-}
-
-function buildContent(text, images) {
-  if (!images || images.length === 0) return text;
-  return [
-    ...images.map(img => ({
-      type: 'image',
-      source: { type: 'base64', media_type: img.mediaType, data: img.base64 },
-    })),
-    { type: 'text', text },
-  ];
-}
+// thread_ts → clickup task id
+const ticketThreads = new Map();
 
 async function resolveDisplayName(client, userId) {
   try {
@@ -102,7 +77,52 @@ async function createClickUpTask({ title, description, assignee, priority, categ
   return response.data;
 }
 
-async function handleTicket({ parsed, requesterName, threadTs, channel, say, client }) {
+async function attachFilesToTask(taskId, files) {
+  for (const file of (files || [])) {
+    try {
+      const resp = await axios.get(file.url_private, {
+        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+        responseType: 'arraybuffer',
+      });
+      const form = new FormData();
+      form.append('attachment', Buffer.from(resp.data), {
+        filename: file.name || file.title || 'attachment',
+        contentType: file.mimetype || 'application/octet-stream',
+      });
+      await axios.post(
+        `https://api.clickup.com/api/v2/task/${taskId}/attachment`,
+        form,
+        {
+          headers: {
+            Authorization: process.env.CLICKUP_API_TOKEN,
+            ...form.getHeaders(),
+          },
+        }
+      );
+    } catch (err) {
+      console.error('ClickUp attachment error:', err.message);
+    }
+  }
+}
+
+async function addClickUpComment(taskId, text) {
+  try {
+    await axios.post(
+      `https://api.clickup.com/api/v2/task/${taskId}/comment`,
+      { comment_text: text },
+      {
+        headers: {
+          Authorization: process.env.CLICKUP_API_TOKEN,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+  } catch (err) {
+    console.error('ClickUp comment error:', err.message);
+  }
+}
+
+async function handleTicket({ parsed, requesterName, threadTs, channel, say, client, files }) {
   const threadUrl = `${WORKSPACE_URL}/archives/${CHANNEL_ID}/p${threadTs.replace('.', '')}`;
   let task;
   try {
@@ -122,6 +142,9 @@ async function handleTicket({ parsed, requesterName, threadTs, channel, say, cli
     return;
   }
 
+  await attachFilesToTask(task.id, files);
+  ticketThreads.set(threadTs, task.id);
+
   await client.reactions.add({ channel, timestamp: threadTs, name: 'clipboard' });
   await say({
     text: `:clipboard: Ticket logged → ${task.url}\nAssigned to <@${SLACK_USERS[parsed.assignee] || SLACK_USERS.patrick}>`,
@@ -139,56 +162,70 @@ app.message(async ({ message, say, client }) => {
 
   const isThreadReply = message.thread_ts && message.thread_ts !== message.ts;
 
-  // Handle follow-up replies to clarifying questions
   if (isThreadReply) {
+    // Handle reply to a pending clarifying question
     const pending = pendingFollowups.get(message.thread_ts);
-    if (!pending || pending.userId !== message.user) return;
-    pendingFollowups.delete(message.thread_ts);
+    if (pending && pending.userId === message.user) {
+      pendingFollowups.delete(message.thread_ts);
 
-    const requesterName = await resolveDisplayName(client, message.user);
-    const followupImages = await fetchImages(message.files);
-    const followupText = message.text || '';
+      const requesterName = await resolveDisplayName(client, message.user);
+      const followupText = message.text || '';
+      const allFiles = [...(pending.files || []), ...(message.files || [])];
+      const followupFileNote = message.files && message.files.length > 0
+        ? `\n\n[User attached ${message.files.length} file(s) — being added to ClickUp task as attachments]`
+        : '';
 
-    let parsed;
-    try {
-      parsed = await callClaude([
-        { role: 'user', content: buildContent(`New message from ${requesterName}:\n\n${pending.originalText}`, pending.images) },
-        { role: 'assistant', content: JSON.stringify({ type: 'needs_info', clarifying_question: pending.question }) },
-        { role: 'user', content: buildContent(`Additional info from ${requesterName}:\n\n${followupText}`, followupImages) },
-      ]);
-    } catch (err) {
-      console.error('Claude error (followup):', err.message);
+      let parsed;
+      try {
+        parsed = await callClaude([
+          { role: 'user', content: `New message from ${requesterName}:\n\n${pending.originalText}${pending.fileNote}` },
+          { role: 'assistant', content: JSON.stringify({ type: 'needs_info', clarifying_question: pending.question }) },
+          { role: 'user', content: `Additional info from ${requesterName}:\n\n${followupText}${followupFileNote}` },
+        ]);
+      } catch (err) {
+        console.error('Claude error (followup):', err.message);
+        return;
+      }
+
+      if (parsed.type === 'ticket') {
+        await handleTicket({ parsed, requesterName, threadTs: message.thread_ts, channel: message.channel, say, client, files: allFiles });
+      } else if (parsed.type === 'self-serve') {
+        await say({ text: parsed.direct_response, thread_ts: message.thread_ts });
+      }
       return;
     }
 
-    if (parsed.type === 'ticket') {
-      await handleTicket({ parsed, requesterName, threadTs: message.thread_ts, channel: message.channel, say, client });
-    } else if (parsed.type === 'self-serve') {
-      await say({ text: parsed.direct_response, thread_ts: message.thread_ts });
+    // Sync any non-bot thread reply to ClickUp as a comment
+    const taskId = ticketThreads.get(message.thread_ts);
+    if (taskId) {
+      const commenterName = await resolveDisplayName(client, message.user);
+      const replyText = message.text || '';
+
+      if (replyText.trim()) {
+        await addClickUpComment(taskId, `${commenterName}: ${replyText}`);
+      }
+      if (message.files && message.files.length > 0) {
+        await attachFilesToTask(taskId, message.files);
+      }
     }
     return;
   }
 
   // Top-level message
   let userText = message.text || '';
-  const images = await fetchImages(message.files);
+  const files = message.files || [];
+  const fileNote = files.length > 0
+    ? `\n\n[User attached ${files.length} file(s) — being added to ClickUp task as attachments]`
+    : '';
 
-  // Mention non-image attachments as text note
-  const nonImageFiles = (message.files || []).filter(f => !IMAGE_TYPES.includes(f.mimetype));
-  if (nonImageFiles.length > 0) {
-    const names = nonImageFiles.map(f => f.name || f.title || 'file').join(', ');
-    const note = `[User attached file(s): ${names} — visible in Slack thread]`;
-    userText = userText ? `${userText}\n\n${note}` : note;
-  }
-
-  if (!userText.trim() && images.length === 0) return;
+  if (!userText.trim() && files.length === 0) return;
 
   const requesterName = await resolveDisplayName(client, message.user);
 
   let parsed;
   try {
     parsed = await callClaude([
-      { role: 'user', content: buildContent(`New message from ${requesterName}:\n\n${userText}`, images) },
+      { role: 'user', content: `New message from ${requesterName}:\n\n${userText}${fileNote}` },
     ]);
   } catch (err) {
     console.error('Claude error:', err.message);
@@ -207,7 +244,8 @@ app.message(async ({ message, say, client }) => {
     pendingFollowups.set(message.ts, {
       userId: message.user,
       originalText: userText,
-      images,
+      fileNote,
+      files,
       question: parsed.clarifying_question,
     });
     await say({ text: parsed.clarifying_question, thread_ts: message.ts });
@@ -215,7 +253,7 @@ app.message(async ({ message, say, client }) => {
   }
 
   if (parsed.type === 'ticket') {
-    await handleTicket({ parsed, requesterName, threadTs: message.ts, channel: message.channel, say, client });
+    await handleTicket({ parsed, requesterName, threadTs: message.ts, channel: message.channel, say, client, files });
   }
 });
 

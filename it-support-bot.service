@@ -1,17 +1,27 @@
 [Unit]
 Description=LAL IT Support Slack Bot
-After=network.target
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=hussein
+User=it-support-bot
 WorkingDirectory=/opt/cc-slack-support
 ExecStart=/usr/bin/node index.js
-Restart=always
-RestartSec=10
+Restart=on-failure
+RestartSec=15
+# Stop restart loop if it crashes 5 times within 5 minutes
+StartLimitIntervalSec=300
+StartLimitBurst=5
 EnvironmentFile=/opt/cc-slack-support/.env
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=it-support-bot
+# Give the process 30s to start before systemd marks it as failed
+TimeoutStartSec=30
+# Kill signal: SIGTERM first, then SIGKILL after 10s
+TimeoutStopSec=10
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target

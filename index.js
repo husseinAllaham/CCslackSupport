@@ -206,7 +206,8 @@ app.error(async (error) => {
 });
 
 app.message(async ({ message, say, client }) => {
-  if (message.subtype || message.bot_id) return;
+  if (message.bot_id) return;
+  if (message.subtype && message.subtype !== 'file_share') return;
   if (message.channel !== CHANNEL_ID) return;
 
   log('INFO', `Message received from user=${message.user} thread=${message.thread_ts || 'none'}`);

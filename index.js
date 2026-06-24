@@ -3,6 +3,8 @@ const { App } = require('@slack/bolt');
 const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
 const FormData = require('form-data');
+const fs = require('fs');
+const path = require('path');
 const SYSTEM_PROMPT = require('./system-prompt');
 
 // ─── Crash protection ────────────────────────────────────────────────────────
@@ -46,12 +48,36 @@ const SLACK_USERS = {
 const pendingFollowups = new Map(); // thread_ts → { userId, originalText, fileNote, files, question, createdAt }
 const ticketThreads = new Map();   // thread_ts → { taskId, createdAt }
 
-// Evict entries older than 7 days — runs every hour
+// Persist ticketThreads across restarts so thread replies still sync after service restart
+const STATE_FILE = path.join(__dirname, '.ticket-threads.json');
 const TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function loadTicketThreads() {
+  try {
+    const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    const cutoff = Date.now() - TTL_MS;
+    for (const [k, v] of Object.entries(data)) {
+      if (v.createdAt >= cutoff) ticketThreads.set(k, v);
+    }
+    if (ticketThreads.size > 0) log('INFO', `Restored ${ticketThreads.size} ticket thread(s) from disk`);
+  } catch (_) {}
+}
+
+function saveTicketThreads() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(Object.fromEntries(ticketThreads)));
+  } catch (err) {
+    log('ERROR', `Failed to save ticket threads: ${err.message}`);
+  }
+}
+
+// Evict entries older than 7 days — runs every hour
 setInterval(() => {
   const cutoff = Date.now() - TTL_MS;
   for (const [k, v] of pendingFollowups) if (v.createdAt < cutoff) pendingFollowups.delete(k);
-  for (const [k, v] of ticketThreads) if (v.createdAt < cutoff) ticketThreads.delete(k);
+  let changed = false;
+  for (const [k, v] of ticketThreads) if (v.createdAt < cutoff) { ticketThreads.delete(k); changed = true; }
+  if (changed) saveTicketThreads();
 }, 60 * 60 * 1000).unref();
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
@@ -122,14 +148,25 @@ async function createClickUpTask({ title, description, assignee, priority, categ
 async function attachFilesToTask(taskId, files) {
   for (const file of (files || [])) {
     try {
-      const resp = await axios.get(file.url_private, {
+      // url_private_download avoids the S3 redirect that strips the Authorization header
+      const downloadUrl = file.url_private_download || file.url_private;
+      const resp = await axios.get(downloadUrl, {
         headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
         responseType: 'arraybuffer',
-        timeout: 15000,
+        timeout: 30000,
+        maxRedirects: 5,
       });
+      const buffer = Buffer.isBuffer(resp.data) ? resp.data : Buffer.from(resp.data);
+      log('INFO', `Downloaded "${file.name}" — ${buffer.length} bytes`);
+
+      // Ensure filename has an extension — ClickUp uses it to determine file type for preview
+      const MIME_EXT = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp', 'application/pdf': '.pdf' };
+      let filename = file.name || file.title || 'attachment';
+      if (!path.extname(filename) && MIME_EXT[file.mimetype]) filename += MIME_EXT[file.mimetype];
+
       const form = new FormData();
-      form.append('attachment', Buffer.from(resp.data), {
-        filename: file.name || file.title || 'attachment',
+      form.append('attachment', buffer, {
+        filename,
         contentType: file.mimetype || 'application/octet-stream',
       });
       await axios.post(
@@ -140,10 +177,10 @@ async function attachFilesToTask(taskId, files) {
             Authorization: process.env.CLICKUP_API_TOKEN,
             ...form.getHeaders(),
           },
-          timeout: 15000,
+          timeout: 30000,
         }
       );
-      log('INFO', `Attached file "${file.name}" to task ${taskId}`);
+      log('INFO', `Attached "${filename}" to task ${taskId}`);
     } catch (err) {
       log('ERROR', `ClickUp attachment error (${file.name}): ${err.message}`);
     }
@@ -192,6 +229,7 @@ async function handleTicket({ parsed, requesterName, threadTs, channel, say, cli
 
   await attachFilesToTask(task.id, files);
   ticketThreads.set(threadTs, { taskId: task.id, createdAt: Date.now() });
+  saveTicketThreads();
 
   await client.reactions.add({ channel, timestamp: threadTs, name: 'clipboard' });
   await say({
@@ -333,6 +371,7 @@ app.message(async ({ message, say, client }) => {
     process.exit(1);
   }
 
+  loadTicketThreads();
   await app.start();
   log('INFO', '✓ IT Support bot running (socket mode)');
 })();
